@@ -73,8 +73,10 @@ def isPrimitiveRoot (n a : Nat) (primeFactors : Array Nat) : Bool :=
 
 /-- Find a primitive root mod `n` by trying 2, 3, 4, ... -/
 partial def findPrimitiveRoot (n : Nat) (primeFactors : Array Nat) : MetaM Nat := do
-  for a in List.range (n - 1) |>.map (· + 2) do
+  let mut a := 2
+  while a < n do
     if isPrimitiveRoot n a primeFactors then return a
+    a := a + 1
   throwError "no primitive root found for {n}"
 
 /-- Compute the sieve bound `m` for pock3: the smallest m ≥ 1 such that
@@ -236,13 +238,82 @@ simproc_decl natPrimeCert (Nat.Prime _) := fun e => do
   let eqTrueProof := mkApp2 (mkConst ``eq_true) propE proof
   return .done { expr := q(True), proof? := some eqTrueProof }
 
-/-- Tactic that closes `Nat.Prime n` goals by computing Pocklington certificates. -/
-elab "prime_cert_tac" : tactic => Elab.Tactic.liftMetaFinishingTactic fun g => do
-  let t ← g.getType
-  unless t.isAppOfArity ``Nat.Prime 1 do throwError "goal is not Nat.Prime _"
-  let arg := t.appArg!
-  let some n := arg.nat? | throwError "argument is not a numeric literal"
-  let (_, proof) ← certifyPrime n ∅
-  g.assign proof
+/-- Find an odd prime `w` such that `val` is a quadratic non-residue mod `w`. -/
+def findQNRWitness (val : Nat) : MetaM Nat := do
+  for w in [3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61,
+            67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137,
+            139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199] do
+    if Nat.Prime w && powModTR' val (w / 2) w == w - 1 then
+      return w
+  throwError "no QNR witness found for {val}"
+
+structure CertState where
+  smalls : Array Nat := #[]
+  steps : Array String := #[]
+  visited : Std.HashSet Nat := {}
+
+/-- Generate a `prime_cert%` syntax string by computing pock3 certificates.
+Mirrors the Python script's logic exactly. -/
+partial def genCert (p : Nat) (st : CertState) : MetaM CertState := do
+  if p ≤ 2300 then
+    return { st with smalls := st.smalls.push p }
+  if st.visited.contains p then return st
+  let st := { st with visited := st.visited.insert p }
+  let nm1 := p - 1
+  let (e, oddPart) := extract2 nm1
+  -- Cube root bound
+  let mut target := 1
+  while (target + 1) ^ 3 ≤ p do target := target + 1
+  target := target + 2
+  -- Factor odd part minimally
+  let (oddFactors, _) := partialFactor oddPart (target / (2 ^ e) + 1)
+  let oddProduct := oddFactors.foldl (fun acc (pe : Nat × Nat) => acc * pe.1 ^ pe.2) 1
+  let bigF := (2 ^ e) * oddProduct
+  let allPrimeFactors := #[2] ++ oddFactors.map (·.1)
+  let root ← findPrimitiveRoot p allPrimeFactors
+  let bigR := nm1 / bigF
+  let twoF := 2 * bigF
+  let r := bigR % twoF
+  let s := bigR / twoF
+  let m := computeSieveBound p bigF
+  -- Find mode
+  let (mode, st1) ←
+    if s == 0 then pure ("0", st)
+    else if r ^ 2 < 8 * s then pure ("<", st)
+    else do
+      let val := r ^ 2 - 8 * s
+      let w ← findQNRWitness val
+      pure (toString w, { st with smalls := st.smalls.push w })
+  -- Recurse on factor primes
+  let mut cur := st1
+  for i in List.range oddFactors.size do
+    cur ← genCert (oddFactors[i]!).1 cur
+  -- Build step string
+  let pp (b exp : Nat) : String := if exp == 1 then toString b else s!"{b} ^ {exp}"
+  let fStr := String.intercalate " * "
+    ([pp 2 e] ++ oddFactors.toList.map (fun (q, exp) => pp q exp))
+  return { cur with steps := cur.steps.push s!"({p}, {root}, {m}, {mode}, {fStr})" }
+
+open Lean in
+/-- Term elaborator that generates `prime_cert%` syntax and elaborates it.
+Computes the certificate at elaboration time, then expands to `prime_cert%`
+which handles kernel checking efficiently. -/
+elab "prime_cert_auto%" n:num : term => do
+  let nVal := n.getNat
+  let st ← genCert nVal {}
+  let smallsDedup := st.smalls.toList.eraseDups.mergeSort (· < ·)
+  let smallStr := String.intercalate "; " (smallsDedup.map toString)
+  let stepsStr := String.intercalate "; " st.steps.toList
+  let src := if st.steps.isEmpty then
+    s!"prime_cert% [small \{{smallStr}}]"
+  else
+    s!"prime_cert% [small \{{smallStr}}, pock3 \{{stepsStr}}]"
+  let env ← getEnv
+  let stx ← match Parser.runParserCategory env `term src with
+    | .ok stx => pure stx
+    | .error e => throwError "parse error: {e}"
+  let nE := mkNatLit nVal
+  let expectedType := mkApp (mkConst ``Nat.Prime) nE
+  Elab.Term.elabTerm (stx := stx) (expectedType? := some expectedType)
 
 end PrimeCert.Simproc
