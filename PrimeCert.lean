@@ -6,4 +6,5 @@ import PrimeCert.Pocklington3
 import PrimeCert.PowMod
 import PrimeCert.PredMod
 import PrimeCert.SmallPrimes
+import PrimeCert.Simproc
 import PrimeCert.Wieferich
